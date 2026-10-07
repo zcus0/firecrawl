@@ -1,0 +1,152 @@
+# Firecrawl self-hosted — resource kecil (VPS 12GB), SearXNG sebagai search engine.
+# Jangan pakai compose project name default 'firecrawl' yang bentrok; sudah diset.
+# Header doc: lihat .env di root firecrawl-local/firecrawl.
+
+name: firecrawl
+
+x-common-service: &common-service
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  networks:
+    - backend
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "5m"
+      max-file: "2"
+
+x-common-env: &common-env
+  REDIS_URL: redis://redis:6379
+  REDIS_RATE_LIMIT_URL: redis://redis:6379
+  REDIS_EVICT_URL: redis://redis:6379
+  PLAYWRIGHT_MICROSERVICE_URL: http://playwright-service:3000/scrape
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: postgres
+  POSTGRES_HOST: nuq-postgres
+  POSTGRES_PORT: 5432
+  USE_DB_AUTHENTICATION: "false"
+  NUM_WORKERS_PER_QUEUE: "2"
+  CRAWL_CONCURRENT_REQUESTS: "5"
+  MAX_CONCURRENT_JOBS: "3"
+  BROWSER_POOL_SIZE: "2"
+  TEST_API_KEY: fc-local-dev-key
+  LOGGING_LEVEL: info
+  # Search engine lokal (JSON API SearXNG)
+  SEARXNG_ENDPOINT: http://searxng-core:8080
+  SEARXNG_ENGINES: ""
+  SEARXNG_CATEGORIES: ""
+
+services:
+  playwright-service:
+    image: ghcr.io/firecrawl/playwright-service:latest
+    environment:
+      PORT: 3000
+      PROXY_SERVER:
+      PROXY_USERNAME:
+      PROXY_PASSWORD:
+      ALLOW_LOCAL_WEBHOOKS: "true"
+      BLOCK_MEDIA: "true"
+      MAX_CONCURRENT_PAGES: 5
+    networks:
+      - backend
+    # security_opt / cap_drop sudah di base compose — duplikat di override
+    # bikin array merge menghasilkan item identik dan gagal validasi.
+    cpus: 1.5
+    mem_limit: 2G
+    memswap_limit: 2G
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=512m
+
+  api:
+    <<: *common-service
+    environment:
+      <<: *common-env
+      HOST: 0.0.0.0
+      PORT: 3002
+      EXTRACT_WORKER_PORT: 3004
+      WORKER_PORT: 3005
+      NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
+      HARNESS_STARTUP_TIMEOUT_MS: 60000
+      ENV: local
+    depends_on:
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      nuq-postgres:
+        condition: service_started
+      searxng-init-check:
+        condition: service_completed_successfully
+    # !override ganti total list ports base (compose merge = append, yang bikin
+    # dua binding host:3002 dan gagal "address already in use").
+    ports: !override
+      - "127.0.0.1:3002:3002"
+    # Harness firecrawl spawn ~10 proses node; 2.5G kena OOM (exit 137,
+    # memcg kill). Base compose rekomendasi 8G — ambil tengah 5G karena VPS
+    # 12GB (7GB available) dan stack pendukung sudah ~1GB.
+    cpus: 2.0
+    mem_limit: 5G
+    memswap_limit: 5G
+
+  redis:
+    image: redis:alpine
+    networks:
+      - backend
+    command: redis-server --bind 0.0.0.0 --save "" --appendonly no
+    mem_limit: 256m
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    networks:
+      - backend
+    command: rabbitmq-server
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    mem_limit: 384m
+
+  nuq-postgres:
+    build: apps/nuq-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    networks:
+      - backend
+    mem_limit: 384m
+
+  # Gate: tunggu SearXNG siap sebelum api start (search engine wajib ada).
+  searxng-init-check:
+    image: curlimages/curl:latest
+    depends_on: []
+    networks:
+      - backend
+    command: >
+      sh -c 'for i in $$(seq 1 60); do
+        curl -sf "http://searxng-core:8080/search?q=ping&format=json" >/dev/null && exit 0;
+        sleep 2;
+      done; echo "SearXNG not ready"; exit 1'
+    restart: "no"
+
+  # FoundationDB (eksperimental, NUQ_BACKEND=postgres default) dimatikan: profile
+  # 'fdb' tidak pernah diaktivasi, jadi kedua service ini tidak ikut up.
+  foundationdb:
+    profiles: ["fdb"]
+  foundationdb-init:
+    profiles: ["fdb"]
+
+networks:
+  backend:
+    name: firecrawl-local
+    external: true
+
+# SearXNG berjalan di network eksternal 'firecrawl-local' (lihat ../docker-compose.yml);
+# semua service di sini join network yang sama supaya 'searxng-core' bisa di-resolve.
